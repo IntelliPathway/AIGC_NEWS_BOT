@@ -1,0 +1,796 @@
+import re
+import logging
+import json
+import requests
+from datetime import datetime
+import jieba
+import difflib
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+class FactChecker:
+    def __init__(self):
+        # 设置日志记录器
+        self.logger = self._setup_logger()
+        
+        # 加载可信来源列表
+        self.trusted_sources = self._load_trusted_sources()
+        
+        # 加载事实数据库
+        self.fact_database = self._load_fact_database()
+        
+        # 初始化TF-IDF向量化器
+        self.vectorizer = TfidfVectorizer(analyzer='word', tokenizer=lambda x: jieba.cut(x))
+        
+        # 初始化事实向量
+        self._prepare_fact_vectors()
+        
+        # 加载敏感话题列表
+        self.sensitive_topics = [
+            "政治", "宗教", "种族", "性别", "歧视", "隐私", "数据泄露", "安全漏洞",
+            "军事", "国家安全", "商业机密", "内部信息", "未公开数据", "股价", "财务预测"
+        ]
+        
+        # 加载常见错误模式
+        self.error_patterns = [
+            {
+                "pattern": r"(100%|百分之百|完全|绝对).*?(准确|精确|正确|可靠)",
+                "description": "夸大准确性",
+                "severity": "中"
+            },
+            {
+                "pattern": r"(彻底解决|根本解决|完全解决|永久解决).*?(问题|缺陷|漏洞|困难)",
+                "description": "夸大解决能力",
+                "severity": "中"
+            },
+            {
+                "pattern": r"(首个|第一个|唯一一个|独一无二|前所未有).*?(技术|产品|方案|模型)",
+                "description": "可能的首创性夸大",
+                "severity": "低"
+            },
+            {
+                "pattern": r"(超越|超过|优于).*?(人类|专家|医生|律师|专业人士)",
+                "description": "可能夸大AI能力",
+                "severity": "中"
+            },
+            {
+                "pattern": r"(即将|马上|很快|不久后|近期).*?(取代|替代|淘汰).*?(人类|工作|职业)",
+                "description": "夸大AI替代效应",
+                "severity": "高"
+            }
+        ]
+    
+    def _setup_logger(self):
+        """设置日志记录器"""
+        logger = logging.getLogger("FactChecker")
+        logger.setLevel(logging.INFO)
+        
+        # 创建控制台处理器
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        
+        # 创建文件处理器
+        fh = logging.FileHandler("fact_checker.log")
+        fh.setLevel(logging.INFO)
+        
+        # 创建格式化器
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch.setFormatter(formatter)
+        fh.setFormatter(formatter)
+        
+        # 添加处理器到记录器
+        logger.addHandler(ch)
+        logger.addHandler(fh)
+        
+        return logger
+    
+    def _load_trusted_sources(self):
+        """加载可信来源列表"""
+        try:
+            with open("trusted_sources.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            # 如果文件不存在，返回一个基本的可信来源列表
+            return {
+                "官方媒体": [
+                    "人民网", "新华网", "中国科学报", "科技日报", "中国日报", "光明日报"
+                ],
+                "专业科技媒体": [
+                    "36氪", "机器之心", "量子位", "雷锋网", "智东西", "AI科技评论", "DeepTech深科技"
+                ],
+                "研究机构": [
+                    "百度研究院", "阿里达摩院", "腾讯AI Lab", "华为诺亚方舟实验室", "智谱AI"
+                ],
+                "国外媒体": [
+                    "MIT科技评论中文版", "哈佛商业评论中文版", "Synced AI中文版", "IEEE Spectrum"
+                ],
+                "公司官方": [
+                    "OpenAI博客", "百度AI开放平台", "智谱AI", "阿里云", "腾讯云", "华为云"
+                ],
+                "学术机构": [
+                    "清华大学", "北京大学", "中国科学院", "中国工程院", "北京智源人工智能研究院"
+                ]
+            }
+    
+    def _load_fact_database(self):
+        """加载事实数据库"""
+        try:
+            with open("fact_database.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            # 如果文件不存在，返回一个空的事实数据库
+            return []
+    
+    def _prepare_fact_vectors(self):
+        """准备事实向量"""
+        if not self.fact_database:
+            self.fact_vectors = None
+            return
+        
+        # 提取事实描述
+        fact_texts = [fact["description"] for fact in self.fact_database]
+        
+        # 计算TF-IDF向量
+        self.fact_vectors = self.vectorizer.fit_transform(fact_texts)
+    
+    def check_source_credibility(self, news):
+        """检查新闻来源的可信度"""
+        source = news.get("source", "")
+        
+        # 如果没有来源信息，返回低可信度
+        if not source:
+            self.logger.warning(f"新闻 '{news['title']}' 没有来源信息")
+            return {
+                "credibility": "低",
+                "reason": "缺少来源信息",
+                "suggestion": "添加明确的信息来源"
+            }
+        
+        # 检查是否是可信来源
+        for category, sources in self.trusted_sources.items():
+            for trusted_source in sources:
+                if trusted_source in source:
+                    self.logger.info(f"新闻 '{news['title']}' 来自可信来源: {source} (类别: {category})")
+                    return {
+                        "credibility": "高",
+                        "reason": f"来源属于可信的{category}",
+                        "source_category": category
+                    }
+        
+        # 如果不是可信来源，返回中等可信度
+        self.logger.warning(f"新闻 '{news['title']}' 来源 {source} 不在可信来源列表中")
+        return {
+            "credibility": "中",
+            "reason": "来源不在预定义的可信来源列表中",
+            "suggestion": "交叉验证信息或寻找更权威的来源"
+        }
+    
+    def check_claim_against_facts(self, claim):
+        """检查声明是否与已知事实一致"""
+        if not self.fact_database or not self.fact_vectors:
+            self.logger.warning("事实数据库为空，无法进行事实核验")
+            return {
+                "consistency": "未知",
+                "reason": "事实数据库为空，无法进行核验",
+                "suggestion": "建立或更新事实数据库"
+            }
+        
+        # 计算声明的TF-IDF向量
+        claim_vector = self.vectorizer.transform([claim])
+        
+        # 计算与所有事实的相似度
+        similarities = cosine_similarity(claim_vector, self.fact_vectors)[0]
+        
+        # 找出最相似的事实
+        max_similarity_index = np.argmax(similarities)
+        max_similarity = similarities[max_similarity_index]
+        
+        # 如果最大相似度低于阈值，认为没有相关事实
+        if max_similarity < 0.3:
+            self.logger.info(f"声明 '{claim}' 在事实数据库中没有相关事实")
+            return {
+                "consistency": "未知",
+                "reason": "在事实数据库中没有找到相关事实",
+                "suggestion": "寻找更多信息来源进行验证"
+            }
+        
+        # 获取最相似的事实
+        most_similar_fact = self.fact_database[max_similarity_index]
+        
+        # 判断声明与事实的一致性
+        if max_similarity >= 0.7:
+            self.logger.info(f"声明 '{claim}' 与已知事实高度一致")
+            return {
+                "consistency": "高",
+                "reason": "与已知事实高度一致",
+                "matched_fact": most_similar_fact,
+                "similarity": max_similarity
+            }
+        elif max_similarity >= 0.5:
+            self.logger.info(f"声明 '{claim}' 与已知事实部分一致")
+            return {
+                "consistency": "中",
+                "reason": "与已知事实部分一致",
+                "matched_fact": most_similar_fact,
+                "similarity": max_similarity,
+                "suggestion": "注意可能存在细节差异"
+            }
+        else:
+            self.logger.warning(f"声明 '{claim}' 与已知事实相似度低")
+            return {
+                "consistency": "低",
+                "reason": "与已知事实相似度低",
+                "matched_fact": most_similar_fact,
+                "similarity": max_similarity,
+                "suggestion": "建议进一步核实或提供更多证据"
+            }
+    
+    def extract_claims(self, news):
+        """从新闻中提取需要核验的声明"""
+        # 获取新闻内容
+        title = news.get("title", "")
+        summary = news.get("summary", "")
+        content = news.get("content", "")
+        
+        # 合并文本
+        full_text = title + " " + summary + " " + content
+        
+        # 使用简单的启发式方法提取声明
+        # 1. 包含引号的内容可能是声明
+        quoted_claims = re.findall(r'"([^"]+)"', full_text)
+        quoted_claims.extend(re.findall(r'"([^"]+)"', full_text))
+        
+        # 2. 包含特定标志词的句子可能是声明
+        claim_indicators = [
+            "表示", "称", "宣称", "宣布", "强调", "指出", "认为", "声称", "宣称", "透露",
+            "透露", "暗示", "宣称", "宣告", "宣示", "宣讲", "宣扬", "宣传", "报道", "爆料"
+        ]
+        
+        # 将文本分割成句子
+        sentences = re.split(r'[。！？!?]', full_text)
+        
+        indicator_claims = []
+        for sentence in sentences:
+            for indicator in claim_indicators:
+                if indicator in sentence:
+                    indicator_claims.append(sentence.strip())
+                    break
+        
+        # 3. 包含数字和百分比的句子可能是事实性声明
+        number_claims = []
+        for sentence in sentences:
+            if re.search(r'\d+(\.\d+)?%|\d+(\.\d+)?倍|\d+(\.\d+)?个', sentence):
+                number_claims.append(sentence.strip())
+        
+        # 合并所有声明并去重
+        all_claims = quoted_claims + indicator_claims + number_claims
+        unique_claims = list(set(all_claims))
+        
+        # 过滤掉太短的声明
+        filtered_claims = [claim for claim in unique_claims if len(claim) > 10]
+        
+        # 记录提取的声明
+        self.logger.info(f"从新闻 '{news['title']}' 中提取了 {len(filtered_claims)} 条声明")
+        
+        return filtered_claims
+    
+    def detect_exaggeration(self, news):
+        """检测新闻中的夸大表述"""
+        # 获取新闻内容
+        title = news.get("title", "")
+        summary = news.get("summary", "")
+        content = news.get("content", "")
+        
+        # 合并文本
+        full_text = title + " " + summary + " " + content
+        
+        # 检测常见的夸大表述模式
+        exaggerations = []
+        
+        for pattern in self.error_patterns:
+            matches = re.findall(pattern["pattern"], full_text)
+            for match in matches:
+                # 提取匹配的上下文
+                match_str = match[0] + "..." + match[1] if isinstance(match, tuple) else match
+                context = self._get_context(full_text, match_str)
+                
+                exaggerations.append({
+                    "text": context,
+                    "type": pattern["description"],
+                    "severity": pattern["severity"]
+                })
+        
+        # 记录检测到的夸大表述
+        if exaggerations:
+            self.logger.warning(f"在新闻 '{news['title']}' 中检测到 {len(exaggerations)} 处可能的夸大表述")
+        
+        return exaggerations
+    
+    def _get_context(self, text, match_str, context_length=50):
+        """获取匹配文本的上下文"""
+        # 找到匹配文本在原文中的位置
+        match_pos = text.find(match_str) if isinstance(match_str, str) else -1
+        
+        if match_pos == -1:
+            return match_str
+        
+        # 提取上下文
+        start = max(0, match_pos - context_length)
+        end = min(len(text), match_pos + len(match_str) + context_length)
+        
+        context = text[start:end]
+        
+        # 如果上下文被截断，添加省略号
+        if start > 0:
+            context = "..." + context
+        if end < len(text):
+            context = context + "..."
+        
+        return context
+    
+    def check_sensitive_topics(self, news):
+        """检查新闻是否涉及敏感话题"""
+        # 获取新闻内容
+        title = news.get("title", "")
+        summary = news.get("summary", "")
+        content = news.get("content", "")
+        
+        # 合并文本
+        full_text = title + " " + summary + " " + content
+        
+        # 检查是否包含敏感话题关键词
+        sensitive_matches = []
+        
+        for topic in self.sensitive_topics:
+            if topic in full_text:
+                # 提取包含敏感话题的上下文
+                context = self._get_context(full_text, topic)
+                
+                sensitive_matches.append({
+                    "topic": topic,
+                    "context": context
+                })
+        
+        # 记录检测到的敏感话题
+        if sensitive_matches:
+            self.logger.warning(f"新闻 '{news['title']}' 涉及 {len(sensitive_matches)} 个敏感话题")
+        
+        return sensitive_matches
+    
+    def check_fact_consistency(self, news1, news2):
+        """检查两条新闻之间的事实一致性"""
+        # 提取两条新闻的声明
+        claims1 = self.extract_claims(news1)
+        claims2 = self.extract_claims(news2)
+        
+        # 如果没有提取到声明，返回无法比较
+        if not claims1 or not claims2:
+            self.logger.warning(f"无法比较新闻 '{news1['title']}' 和 '{news2['title']}' 的事实一致性，缺少可比较的声明")
+            return {
+                "consistency": "未知",
+                "reason": "缺少可比较的声明",
+                "suggestion": "提取更多具体事实声明进行比较"
+            }
+        
+        # 计算所有声明对之间的相似度
+        consistencies = []
+        
+        for claim1 in claims1:
+            for claim2 in claims2:
+                # 计算两个声明的相似度
+                similarity = difflib.SequenceMatcher(None, claim1, claim2).ratio()
+                
+                # 如果相似度高，检查是否存在事实冲突
+                if similarity >= 0.5:
+                    # 这里使用简单的冲突检测，实际应用中可能需要更复杂的语义分析
+                    conflict = self._detect_conflict(claim1, claim2)
+                    
+                    consistencies.append({
+                        "claim1": claim1,
+                        "claim2": claim2,
+                        "similarity": similarity,
+                        "conflict": conflict
+                    })
+        
+        # 如果没有找到相似的声明，返回无法比较
+        if not consistencies:
+            self.logger.info(f"新闻 '{news1['title']}' 和 '{news2['title']}' 没有相似的声明")
+            return {
+                "consistency": "未知",
+                "reason": "没有找到相似的声明",
+                "suggestion": "两条新闻可能关注不同的方面"
+            }
+        
+        # 分析一致性结果
+        conflicts = [item for item in consistencies if item["conflict"]]
+        
+        if conflicts:
+            self.logger.warning(f"新闻 '{news1['title']}' 和 '{news2['title']}' 存在 {len(conflicts)} 处事实冲突")
+            return {
+                "consistency": "低",
+                "reason": "存在事实冲突",
+                "conflicts": conflicts,
+                "suggestion": "需要进一步核实冲突的信息"
+            }
+        else:
+            self.logger.info(f"新闻 '{news1['title']}' 和 '{news2['title']}' 的事实基本一致")
+            return {
+                "consistency": "高",
+                "reason": "没有发现明显的事实冲突",
+                "consistencies": consistencies
+            }
+    
+    def _detect_conflict(self, claim1, claim2):
+        """检测两个声明之间是否存在冲突"""
+        # 这里使用简单的启发式方法检测冲突
+        # 实际应用中可能需要更复杂的自然语言处理技术
+        
+        # 检查是否包含相反的表述
+        opposite_pairs = [
+            ("增加", "减少"), ("上升", "下降"), ("提高", "降低"), ("扩大", "缩小"),
+            ("加速", "减速"), ("快速", "缓慢"), ("正面", "负面"), ("积极", "消极"),
+            ("支持", "反对"), ("赞同", "反对"), ("同意", "不同意"), ("是", "否"),
+            ("可以", "不可以"), ("能够", "不能"), ("有", "没有"), ("将会", "不会")
+        ]
+        
+        for word1, word2 in opposite_pairs:
+            if word1 in claim1 and word2 in claim2 and self._in_same_context(claim1, claim2, word1, word2):
+                return {
+                    "type": "对立表述",
+                    "details": f"'{word1}' vs '{word2}'",
+                    "severity": "高"
+                }
+            
+            if word2 in claim1 and word1 in claim2 and self._in_same_context(claim1, claim2, word2, word1):
+                return {
+                    "type": "对立表述",
+                    "details": f"'{word2}' vs '{word1}'",
+                    "severity": "高"
+                }
+        
+        # 检查数字不一致
+        numbers1 = re.findall(r'\d+(\.\d+)?', claim1)
+        numbers2 = re.findall(r'\d+(\.\d+)?', claim2)
+        
+        if numbers1 and numbers2:
+            # 检查是否在相似上下文中出现不同的数字
+            for num1 in numbers1:
+                for num2 in numbers2:
+                    if num1 != num2:
+                        # 检查数字前后的上下文是否相似
+                        context1 = self._get_number_context(claim1, num1)
+                        context2 = self._get_number_context(claim2, num2)
+                        
+                        if self._context_similarity(context1, context2) > 0.6:
+                            return {
+                                "type": "数据不一致",
+                                "details": f"'{context1}' vs '{context2}'",
+                                "severity": "中"
+                            }
+        
+        # 没有检测到明显冲突
+        return None
+    
+    def _in_same_context(self, text1, text2, word1, word2, context_window=10):
+        """检查两个词是否在相似的上下文中"""
+        # 获取word1在text1中的上下文
+        word1_pos = text1.find(word1)
+        if word1_pos == -1:
+            return False
+        
+        start1 = max(0, word1_pos - context_window)
+        end1 = min(len(text1), word1_pos + len(word1) + context_window)
+        context1 = text1[start1:word1_pos] + text1[word1_pos+len(word1):end1]
+        
+        # 获取word2在text2中的上下文
+        word2_pos = text2.find(word2)
+        if word2_pos == -1:
+            return False
+        
+        start2 = max(0, word2_pos - context_window)
+        end2 = min(len(text2), word2_pos + len(word2) + context_window)
+        context2 = text2[start2:word2_pos] + text2[word2_pos+len(word2):end2]
+        
+        # 计算上下文相似度
+        return self._context_similarity(context1, context2) > 0.5
+    
+    def _get_number_context(self, text, number, context_window=15):
+        """获取数字在文本中的上下文"""
+        number_pos = text.find(number)
+        if number_pos == -1:
+            return ""
+        
+        start = max(0, number_pos - context_window)
+        end = min(len(text), number_pos + len(number) + context_window)
+        
+        return text[start:end]
+    
+    def _context_similarity(self, context1, context2):
+        """计算两个上下文的相似度"""
+        return difflib.SequenceMatcher(None, context1, context2).ratio()
+    
+    def verify_news(self, news):
+        """对新闻进行综合事实核验"""
+        # 1. 检查来源可信度
+        source_check = self.check_source_credibility(news)
+        
+        # 2. 提取并核验声明
+        claims = self.extract_claims(news)
+        claim_checks = []
+        
+        for claim in claims:
+            check_result = self.check_claim_against_facts(claim)
+            check_result["claim"] = claim
+            claim_checks.append(check_result)
+        
+        # 3. 检测夸大表述
+        exaggerations = self.detect_exaggeration(news)
+        
+        # 4. 检查敏感话题
+        sensitive_topics = self.check_sensitive_topics(news)
+        
+        # 综合评估可信度
+        credibility_score = self._calculate_credibility_score(
+            source_check, claim_checks, exaggerations, sensitive_topics
+        )
+        
+        # 生成核验报告
+        verification_report = {
+            "title": news["title"],
+            "source_check": source_check,
+            "claim_checks": claim_checks,
+            "exaggerations": exaggerations,
+            "sensitive_topics": sensitive_topics,
+            "credibility_score": credibility_score,
+            "verification_time": datetime.now().isoformat()
+        }
+        
+        # 添加核验标签
+        news["fact_check"] = {
+            "verified": True,
+            "credibility_score": credibility_score,
+            "verification_time": datetime.now().isoformat()
+        }
+        
+        # 记录核验结果
+        self.logger.info(f"新闻 '{news['title']}' 核验完成，可信度评分: {credibility_score:.2f}/100")
+        
+        return verification_report
+    
+    def _calculate_credibility_score(self, source_check, claim_checks, exaggerations, sensitive_topics):
+        """计算新闻的可信度评分"""
+        # 基础分数
+        base_score = 70
+        
+        # 1. 来源可信度调整
+        if source_check["credibility"] == "高":
+            base_score += 15
+        elif source_check["credibility"] == "中":
+            base_score += 5
+        else:
+            base_score -= 10
+        
+        # 2. 声明核验调整
+        if claim_checks:
+            consistency_scores = {
+                "高": 10,
+                "中": 0,
+                "低": -15,
+                "未知": -5
+            }
+            
+            total_adjustment = 0
+            for check in claim_checks:
+                total_adjustment += consistency_scores.get(check.get("consistency", "未知"), 0)
+            
+            # 平均调整值，最多±15分
+            avg_adjustment = total_adjustment / len(claim_checks)
+            claim_adjustment = max(min(avg_adjustment, 15), -15)
+            
+            base_score += claim_adjustment
+        
+        # 3. 夸大表述调整
+        if exaggerations:
+            severity_penalties = {
+                "高": -8,
+                "中": -5,
+                "低": -2
+            }
+            
+            exaggeration_penalty = 0
+            for exaggeration in exaggerations:
+                exaggeration_penalty += severity_penalties.get(exaggeration["severity"], -3)
+            
+            # 最多扣15分
+            exaggeration_penalty = max(exaggeration_penalty, -15)
+            
+            base_score += exaggeration_penalty
+        
+        # 4. 敏感话题调整
+        if sensitive_topics:
+            # 每个敏感话题扣3分，最多扣10分
+            sensitive_penalty = min(len(sensitive_topics) * -3, -10)
+            base_score += sensitive_penalty
+        
+        # 确保分数在0-100范围内
+        final_score = max(min(base_score, 100), 0)
+        
+        return final_score
+    
+    def add_fact_to_database(self, fact):
+        """向事实数据库添加新事实"""
+        # 检查事实格式是否正确
+        required_fields = ["description", "source", "timestamp"]
+        for field in required_fields:
+            if field not in fact:
+                self.logger.error(f"添加事实失败，缺少必要字段: {field}")
+                return False
+        
+        # 检查是否已存在相同事实
+        for existing_fact in self.fact_database:
+            similarity = difflib.SequenceMatcher(
+                None, existing_fact["description"], fact["description"]
+            ).ratio()
+            
+            if similarity > 0.8:
+                self.logger.warning(f"事实数据库中已存在相似事实，相似度: {similarity:.2f}")
+                return False
+        
+        # 添加唯一ID
+        fact["id"] = len(self.fact_database) + 1
+        
+        # 添加到数据库
+        self.fact_database.append(fact)
+        
+        # 更新事实向量
+        self._prepare_fact_vectors()
+        
+        # 保存数据库
+        try:
+            with open("fact_database.json", "w", encoding="utf-8") as f:
+                json.dump(self.fact_database, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"成功添加事实到数据库: {fact['description'][:50]}...")
+            return True
+        except Exception as e:
+            self.logger.error(f"保存事实数据库失败: {str(e)}")
+            return False
+    
+    def verify_news_batch(self, news_list):
+        """批量核验新闻"""
+        verified_news = []
+        verification_reports = []
+        
+        for news in news_list:
+            report = self.verify_news(news)
+            verified_news.append(news)
+            verification_reports.append(report)
+        
+        return verified_news, verification_reports
+    
+    def extract_facts_from_news(self, news):
+        """从新闻中提取可能的事实"""
+        # 提取声明
+        claims = self.extract_claims(news)
+        
+        # 过滤出可能是事实的声明
+        facts = []
+        
+        for claim in claims:
+            # 检查声明是否具有事实特征
+            if self._is_likely_fact(claim):
+                facts.append({
+                    "description": claim,
+                    "source": news.get("source", "未知来源"),
+                    "timestamp": news.get("published", datetime.now()).isoformat(),
+                    "url": news.get("link", ""),
+                    "confidence": "中"  # 默认置信度
+                })
+        
+        return facts
+    
+    def _is_likely_fact(self, claim):
+        """判断声明是否可能是事实"""
+        # 1. 包含具体数字或百分比的可能是事实
+        if re.search(r'\d+(\.\d+)?%|\d+(\.\d+)?倍|\d+(\.\d+)?个', claim):
+            return True
+        
+        # 2. 包含具体时间或日期的可能是事实
+        if re.search(r'\d{4}年|\d{1,2}月|\d{1,2}日|今天|昨天|上周|本月', claim):
+            return True
+        
+        # 3. 包含特定实体和动作的可能是事实
+        entity_action_patterns = [
+            r'(OpenAI|谷歌|百度|微软|阿里巴巴|腾讯|华为|智谱AI|科大讯飞).*?(发布|推出|宣布|表示|称)',
+            r'(GPT-\d+|Claude|Gemini|文心一言|通义千问|讯飞星火|Llama).*?(支持|具备|能够|可以)'
+        ]
+        
+        for pattern in entity_action_patterns:
+            if re.search(pattern, claim):
+                return True
+        
+        # 4. 不包含主观评价词的可能是事实
+        subjective_words = ["认为", "觉得", "感觉", "可能", "或许", "也许", "应该", "我认为", "我觉得"]
+        has_subjective = any(word in claim for word in subjective_words)
+        
+        if not has_subjective and len(claim) > 15:
+            return True
+        
+        return False
+    
+    def generate_verification_summary(self, verification_report):
+        """生成核验报告摘要"""
+        title = verification_report["title"]
+        credibility_score = verification_report["credibility_score"]
+        
+        # 确定可信度等级
+        if credibility_score >= 85:
+            credibility_level = "高度可信"
+        elif credibility_score >= 70:
+            credibility_level = "基本可信"
+        elif credibility_score >= 50:
+            credibility_level = "部分可信"
+        else:
+            credibility_level = "可信度低"
+        
+        # 生成摘要
+        summary = f"《{title}》核验报告\n"
+        summary += f"可信度评分: {credibility_score:.1f}/100 ({credibility_level})\n\n"
+        
+        # 来源信息
+        source_check = verification_report["source_check"]
+        summary += f"来源可信度: {source_check['credibility']}\n"
+        summary += f"原因: {source_check['reason']}\n"
+        
+        # 声明核验
+        claim_checks = verification_report["claim_checks"]
+        if claim_checks:
+            summary += f"\n核验了 {len(claim_checks)} 条声明:\n"
+            
+            # 按一致性分组
+            consistency_groups = {"高": [], "中": [], "低": [], "未知": []}
+            for check in claim_checks:
+                consistency = check.get("consistency", "未知")
+                consistency_groups[consistency].append(check)
+            
+            # 显示各组声明数量
+            for consistency, checks in consistency_groups.items():
+                if checks:
+                    summary += f"- {consistency}度一致: {len(checks)} 条\n"
+            
+            # 显示低一致性的声明
+            if consistency_groups["低"]:
+                summary += "\n可能存在问题的声明:\n"
+                for i, check in enumerate(consistency_groups["低"][:3], 1):
+                    summary += f"{i}. "{check['claim'][:50]}..."\n"
+                    if "suggestion" in check:
+                        summary += f"   建议: {check['suggestion']}\n"
+        
+        # 夸大表述
+        exaggerations = verification_report["exaggerations"]
+        if exaggerations:
+            summary += f"\n检测到 {len(exaggerations)} 处可能的夸大表述:\n"
+            for i, exag in enumerate(exaggerations[:3], 1):
+                summary += f"{i}. {exag['type']} (严重程度: {exag['severity']})\n"
+                summary += f"   "{exag['text'][:50]}..."\n"
+        
+        # 敏感话题
+        sensitive_topics = verification_report["sensitive_topics"]
+        if sensitive_topics:
+            topics = [item["topic"] for item in sensitive_topics]
+            summary += f"\n涉及敏感话题: {', '.join(topics)}\n"
+            summary += "建议: 谨慎对待涉及敏感话题的内容，注意多方验证\n"
+        
+        # 总结建议
+        summary += "\n总结建议:\n"
+        if credibility_score >= 85:
+            summary += "该新闻可信度高，内容可靠，可以作为参考信息。\n"
+        elif credibility_score >= 70:
+            summary += "该新闻基本可信，但可能存在部分夸大或不准确之处，建议参考其他来源。\n"
+        elif credibility_score >= 50:
+            summary += "该新闻部分内容可信，但存在一定问题，建议谨慎参考并寻求更权威的信息来源。\n"
+        else:
+            summary += "该新闻可信度较低，存在多处问题，不建议作为可靠信息来源，请寻求更权威的信息。\n"
+        
+        return summary
